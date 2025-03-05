@@ -67,7 +67,11 @@ public class RequestUtilsTest {
       {"select foo from countries where bar > 1", Set.of("countries")},
       {"select 1", null},
       {"SET useMultiStageEngine=true; SELECT table1.foo, table2.bar FROM "
-              + "table1 JOIN table2 ON table1.id = table2.id LIMIT 10;", Set.of("table1", "table2")}
+              + "table1 JOIN table2 ON table1.id = table2.id LIMIT 10;", Set.of("table1", "table2")},
+      // MSE window function
+      {"SET useMultiStageEngine=true; SELECT foo, occurredAt, "
+          + "LAG(occurredAt) OVER (PARTITION BY foo ORDER BY occurredAt) second "
+          + "FROM table1", Set.of("table1")}
     };
   }
 

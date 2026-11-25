@@ -19,7 +19,9 @@
 package org.apache.pinot.broker.routing.segmentpruner;
 
 import com.google.common.annotations.VisibleForTesting;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -40,21 +42,41 @@ import org.apache.pinot.sql.FilterKind;
 
 /// The `MultiPartitionColumnsSegmentPruner` prunes segments based on their partition metadata stored in ZK. The
 /// pruner supports queries with filter (or nested filter) of EQUALITY and IN predicates.
+///
+/// There are two ways to prune, with the same result when their preconditions hold:
+///   - [#prune]: looks at every candidate segment, so its cost grows with the number of candidates. A candidate the
+///     pruner knows nothing about is always kept. This works for any candidates.
+///   - [#pruneAssumingSyncedScope]: looks the filter up in a [PartitionIndex] (partition -> segments), so its cost
+///     grows with the number of segments that match, not with the number of candidates. It relies on the candidates
+///     having been selected from the same segment assignment the pruner has been updated with, because it does not look
+///     at the candidates that are not in the index. The caller is responsible for checking that, see
+///     [SegmentPruner#pruneAssumingSyncedScope].
+///
+/// Thread-safety: updates are synchronized and queries are not. `_segmentColumnPartitionInfoMap` is concurrent, and
+/// `_index` is an immutable snapshot that is replaced by a single volatile write, so a query sees either the index from
+/// before an update or the one from after it.
 public class MultiPartitionColumnsSegmentPruner implements SegmentPruner {
   private final String _tableNameWithType;
   private final Set<String> _partitionColumns;
   private final Map<String, Map<String, SegmentPartitionInfo>> _segmentColumnPartitionInfoMap =
       new ConcurrentHashMap<>();
+  // Online segments whose partition info could not be extracted yet (their ZK metadata is missing). They are not in
+  // _segmentColumnPartitionInfoMap, so that extraction is retried, but they are in the index, where they match every
+  // value. Only touched by init() and the synchronized updates.
+  private final Set<String> _unresolvedSegments = new HashSet<>();
+  private volatile PartitionIndex _index;
 
   public MultiPartitionColumnsSegmentPruner(String tableNameWithType, Set<String> partitionColumns) {
     _tableNameWithType = tableNameWithType;
     _partitionColumns = partitionColumns;
+    _index = PartitionIndex.empty(partitionColumns);
   }
 
   @Override
   public void init(IdealState idealState, ExternalView externalView, List<String> onlineSegments,
       List<ZNRecord> znRecords) {
     // Bulk load partition info for all online segments
+    List<PartitionIndex.SegmentChange> changes = new ArrayList<>(onlineSegments.size());
     for (int idx = 0; idx < onlineSegments.size(); idx++) {
       String segment = onlineSegments.get(idx);
       Map<String, SegmentPartitionInfo> columnPartitionInfoMap =
@@ -62,8 +84,13 @@ public class MultiPartitionColumnsSegmentPruner implements SegmentPruner {
               znRecords.get(idx));
       if (columnPartitionInfoMap != null) {
         _segmentColumnPartitionInfoMap.put(segment, columnPartitionInfoMap);
+        changes.add(new PartitionIndex.SegmentChange(segment, null, columnPartitionInfoMap));
+      } else {
+        _unresolvedSegments.add(segment);
+        changes.add(new PartitionIndex.SegmentChange(segment, null, Map.of()));
       }
     }
+    _index = _index.applyChanges(changes);
   }
 
   @Override
@@ -71,23 +98,85 @@ public class MultiPartitionColumnsSegmentPruner implements SegmentPruner {
       Set<String> onlineSegments, List<String> pulledSegments, List<ZNRecord> znRecords) {
     // NOTE: We don't update all the segment ZK metadata for every external view change, but only the new added/removed
     //       ones. The refreshed segment ZK metadata change won't be picked up.
+    List<PartitionIndex.SegmentChange> changes = new ArrayList<>();
     for (int idx = 0; idx < pulledSegments.size(); idx++) {
       String segment = pulledSegments.get(idx);
-      ZNRecord znRecord = znRecords.get(idx);
-      _segmentColumnPartitionInfoMap.computeIfAbsent(segment,
-          k -> SegmentPartitionUtils.extractPartitionInfoMap(_tableNameWithType, _partitionColumns, k, znRecord));
+      if (_segmentColumnPartitionInfoMap.containsKey(segment)) {
+        continue;
+      }
+      Map<String, SegmentPartitionInfo> columnPartitionInfoMap =
+          SegmentPartitionUtils.extractPartitionInfoMap(_tableNameWithType, _partitionColumns, segment,
+              znRecords.get(idx));
+      boolean wasUnresolved = _unresolvedSegments.contains(segment);
+      if (columnPartitionInfoMap != null) {
+        _segmentColumnPartitionInfoMap.put(segment, columnPartitionInfoMap);
+        _unresolvedSegments.remove(segment);
+        changes.add(new PartitionIndex.SegmentChange(segment, wasUnresolved ? Map.of() : null,
+            columnPartitionInfoMap));
+      } else if (!wasUnresolved) {
+        _unresolvedSegments.add(segment);
+        changes.add(new PartitionIndex.SegmentChange(segment, null, Map.of()));
+      }
     }
-    _segmentColumnPartitionInfoMap.keySet().retainAll(onlineSegments);
+    Iterator<Map.Entry<String, Map<String, SegmentPartitionInfo>>> infoIterator =
+        _segmentColumnPartitionInfoMap.entrySet().iterator();
+    while (infoIterator.hasNext()) {
+      Map.Entry<String, Map<String, SegmentPartitionInfo>> entry = infoIterator.next();
+      if (!onlineSegments.contains(entry.getKey())) {
+        changes.add(new PartitionIndex.SegmentChange(entry.getKey(), entry.getValue(), null));
+        infoIterator.remove();
+      }
+    }
+    Iterator<String> unresolvedIterator = _unresolvedSegments.iterator();
+    while (unresolvedIterator.hasNext()) {
+      String segment = unresolvedIterator.next();
+      if (!onlineSegments.contains(segment)) {
+        changes.add(new PartitionIndex.SegmentChange(segment, Map.of(), null));
+        unresolvedIterator.remove();
+      }
+    }
+    _index = _index.applyChanges(changes);
   }
 
   @Override
   public synchronized void refreshSegment(String segment, @Nullable ZNRecord znRecord) {
+    Map<String, SegmentPartitionInfo> oldColumnPartitionInfo = _segmentColumnPartitionInfoMap.get(segment);
+    Map<String, SegmentPartitionInfo> oldIndexedInfos = oldColumnPartitionInfo;
+    if (oldIndexedInfos == null && _unresolvedSegments.contains(segment)) {
+      oldIndexedInfos = Map.of();
+    }
     Map<String, SegmentPartitionInfo> columnPartitionInfo =
         SegmentPartitionUtils.extractPartitionInfoMap(_tableNameWithType, _partitionColumns, segment, znRecord);
+    Map<String, SegmentPartitionInfo> newIndexedInfos;
     if (columnPartitionInfo != null) {
       _segmentColumnPartitionInfoMap.put(segment, columnPartitionInfo);
+      _unresolvedSegments.remove(segment);
+      newIndexedInfos = columnPartitionInfo;
     } else {
       _segmentColumnPartitionInfoMap.remove(segment);
+      _unresolvedSegments.add(segment);
+      newIndexedInfos = Map.of();
+    }
+    _index = _index.applyChanges(List.of(new PartitionIndex.SegmentChange(segment, oldIndexedInfos, newIndexedInfos)));
+  }
+
+  @Override
+  public Set<String> pruneAssumingSyncedScope(BrokerRequest brokerRequest, Set<String> segments) {
+    Expression filterExpression = brokerRequest.getPinotQuery().getFilterExpression();
+    if (filterExpression == null) {
+      return segments;
+    }
+    PartitionIndex index = _index;
+    if (index.hasUnindexableSegments()) {
+      return prune(brokerRequest, segments);
+    }
+    try {
+      Set<String> matchingSegments = index.resolve(filterExpression, segments);
+      return matchingSegments != null ? matchingSegments : segments;
+    } catch (RuntimeException e) {
+      // The index looks up every value of the filter, which can reach a value (or a branch) that evaluating segments
+      // one by one would never reach. Let that path decide, since it is the one that defines the behavior.
+      return prune(brokerRequest, segments);
     }
   }
 

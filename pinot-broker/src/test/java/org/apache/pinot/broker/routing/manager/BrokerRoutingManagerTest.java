@@ -47,7 +47,10 @@ import org.apache.pinot.broker.routing.instanceselector.TableReplicaHealth;
 import org.apache.pinot.broker.routing.segmentmetadata.SegmentZkMetadataFetcher;
 import org.apache.pinot.broker.routing.segmentpartition.SegmentPartitionMetadataManager;
 import org.apache.pinot.broker.routing.segmentpreselector.SegmentPreSelector;
+import org.apache.pinot.broker.routing.segmentpruner.MultiPartitionColumnsSegmentPruner;
 import org.apache.pinot.broker.routing.segmentpruner.SegmentPruner;
+import org.apache.pinot.broker.routing.segmentpruner.SinglePartitionColumnSegmentPruner;
+import org.apache.pinot.broker.routing.segmentpruner.TimeSegmentPruner;
 import org.apache.pinot.broker.routing.segmentselector.SegmentSelector;
 import org.apache.pinot.broker.routing.tablesampler.TableSampler;
 import org.apache.pinot.broker.routing.timeboundary.TimeBoundaryManager;
@@ -805,6 +808,41 @@ public class BrokerRoutingManagerTest {
     assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg1"));
   }
 
+  @Test
+  public void testCalculateRoutingRecordsPrunerAndInstanceSelectionTimingMetrics()
+      throws Exception {
+    SegmentPruner timePruner = keepingSegmentsPruner(TimeSegmentPruner.class);
+    SegmentPruner partitionPruner = keepingSegmentsPruner(SinglePartitionColumnSegmentPruner.class);
+    SegmentPruner multiPartitionPruner = keepingSegmentsPruner(MultiPartitionColumnsSegmentPruner.class);
+    // Not one of the pruners that are timed
+    SegmentPruner otherPruner = prunerDropping();
+    InstanceSelector instanceSelector = mock(InstanceSelector.class);
+    when(instanceSelector.select(any(), any(), anyLong())).thenReturn(InstanceSelector.SelectionResult.empty(0));
+    putRoutingEntry(TEST_TABLE,
+        createRoutingEntry(TEST_TABLE, selectorOf("seg1", "seg2"),
+            List.of(timePruner, partitionPruner, multiPartitionPruner, otherPruner), instanceSelector,
+            mock(TimeBoundaryManager.class), mock(SegmentPartitionMetadataManager.class), Map.of(), false,
+            _brokerMetrics));
+
+    _routingManager.getRoutingTable(brokerRequest(TEST_TABLE), 1L);
+
+    verify(_brokerMetrics).addTimedTableValue(eq(TEST_TABLE), eq(BrokerTimer.TIME_SEGMENT_PRUNING_TIME_MS), anyLong(),
+        eq(TimeUnit.NANOSECONDS));
+    // One for each of the two partition pruners
+    verify(_brokerMetrics, times(2)).addTimedTableValue(eq(TEST_TABLE),
+        eq(BrokerTimer.PARTITION_SEGMENT_PRUNING_TIME_MS), anyLong(), eq(TimeUnit.NANOSECONDS));
+    verify(_brokerMetrics).addTimedTableValue(eq(TEST_TABLE), eq(BrokerTimer.INSTANCE_SELECTION_TIME_MS), anyLong(),
+        eq(TimeUnit.NANOSECONDS));
+  }
+
+  /// A mock of the given pruner class that prunes nothing, with either of its pruning methods.
+  private static SegmentPruner keepingSegmentsPruner(Class<? extends SegmentPruner> prunerClass) {
+    SegmentPruner pruner = mock(prunerClass);
+    doAnswer(invocation -> invocation.getArgument(1)).when(pruner).prune(any(), any());
+    doAnswer(invocation -> invocation.getArgument(1)).when(pruner).pruneAssumingSyncedScope(any(), any());
+    return pruner;
+  }
+
   private static BrokerRequest brokerRequest(String tableNameWithType) {
     QuerySource querySource = new QuerySource();
     querySource.setTableName(tableNameWithType);
@@ -873,18 +911,27 @@ public class BrokerRoutingManagerTest {
       List<SegmentPruner> segmentPruners, InstanceSelector instanceSelector, TimeBoundaryManager timeBoundaryManager,
       SegmentPartitionMetadataManager partitionMetadataManager, Map<String, ?> samplerInfos, boolean disabled)
       throws Exception {
+    return createRoutingEntry(tableNameWithType, segmentSelector, segmentPruners, instanceSelector,
+        timeBoundaryManager, partitionMetadataManager, samplerInfos, disabled, mock(BrokerMetrics.class));
+  }
+
+  private static Object createRoutingEntry(String tableNameWithType, SegmentSelector segmentSelector,
+      List<SegmentPruner> segmentPruners, InstanceSelector instanceSelector, TimeBoundaryManager timeBoundaryManager,
+      SegmentPartitionMetadataManager partitionMetadataManager, Map<String, ?> samplerInfos, boolean disabled,
+      BrokerMetrics brokerMetrics)
+      throws Exception {
     Class<?> routingEntryClass = Class.forName(BaseBrokerRoutingManager.class.getName() + "$RoutingEntry");
     Constructor<?> constructor = routingEntryClass.getDeclaredConstructor(String.class, String.class, String.class,
         SegmentPreSelector.class, SegmentSelector.class, List.class, InstanceSelector.class, int.class, int.class,
         SegmentZkMetadataFetcher.class, TimeBoundaryManager.class, SegmentPartitionMetadataManager.class, Long.class,
-        Map.class, boolean.class, int.class);
+        Map.class, boolean.class, int.class, BrokerMetrics.class);
     constructor.setAccessible(true);
     SegmentPreSelector segmentPreSelector = onlineSegments -> onlineSegments;
     return constructor.newInstance(tableNameWithType, "/IDEALSTATES/" + tableNameWithType,
         "/EXTERNALVIEW/" + tableNameWithType, segmentPreSelector, segmentSelector, segmentPruners,
         instanceSelector, 1, 1,
         mock(SegmentZkMetadataFetcher.class), timeBoundaryManager, partitionMetadataManager, null, samplerInfos,
-        disabled, 0);
+        disabled, 0, brokerMetrics);
   }
 
   private static Object createSamplerInfo(InstanceSelector instanceSelector)

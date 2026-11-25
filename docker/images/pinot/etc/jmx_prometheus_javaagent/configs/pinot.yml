@@ -287,6 +287,24 @@ rules:
   labels:
     database: "$2"
     table: "$1$3"
+- pattern: "\"org\\.apache\\.pinot\\.common\\.metrics\"<type=\"BrokerMetrics\", name=\"pinot\\.broker\\.(([^.]+)\\.)?([^.]*)\\.timeSegmentPruningTimeMs\"><>(\\w+)"
+  name: "pinot_broker_timeSegmentPruningTimeMs_$4"
+  cache: true
+  labels:
+    database: "$2"
+    table: "$1$3"
+- pattern: "\"org\\.apache\\.pinot\\.common\\.metrics\"<type=\"BrokerMetrics\", name=\"pinot\\.broker\\.(([^.]+)\\.)?([^.]*)\\.partitionSegmentPruningTimeMs\"><>(\\w+)"
+  name: "pinot_broker_partitionSegmentPruningTimeMs_$4"
+  cache: true
+  labels:
+    database: "$2"
+    table: "$1$3"
+- pattern: "\"org\\.apache\\.pinot\\.common\\.metrics\"<type=\"BrokerMetrics\", name=\"pinot\\.broker\\.(([^.]+)\\.)?([^.]*)\\.instanceSelectionTimeMs\"><>(\\w+)"
+  name: "pinot_broker_instanceSelectionTimeMs_$4"
+  cache: true
+  labels:
+    database: "$2"
+    table: "$1$3"
 - pattern: "\"org\\.apache\\.pinot\\.common\\.metrics\"<type=\"BrokerMetrics\", name=\"pinot\\.broker\\.(([^.]+)\\.)?([^.]*)\\.queryTotalTimeMs\"><>(\\w+)"
   name: "pinot_broker_queryTotalTimeMs_$4"
   cache: true

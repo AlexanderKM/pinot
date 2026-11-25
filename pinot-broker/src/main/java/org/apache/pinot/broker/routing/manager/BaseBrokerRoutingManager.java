@@ -68,8 +68,11 @@ import org.apache.pinot.broker.routing.segmentmetadata.SegmentZkMetadataFetcher;
 import org.apache.pinot.broker.routing.segmentpartition.SegmentPartitionMetadataManager;
 import org.apache.pinot.broker.routing.segmentpreselector.SegmentPreSelector;
 import org.apache.pinot.broker.routing.segmentpreselector.SegmentPreSelectorFactory;
+import org.apache.pinot.broker.routing.segmentpruner.MultiPartitionColumnsSegmentPruner;
 import org.apache.pinot.broker.routing.segmentpruner.SegmentPruner;
 import org.apache.pinot.broker.routing.segmentpruner.SegmentPrunerFactory;
+import org.apache.pinot.broker.routing.segmentpruner.SinglePartitionColumnSegmentPruner;
+import org.apache.pinot.broker.routing.segmentpruner.TimeSegmentPruner;
 import org.apache.pinot.broker.routing.segmentselector.SegmentSelector;
 import org.apache.pinot.broker.routing.segmentselector.SegmentSelectorFactory;
 import org.apache.pinot.broker.routing.tablesampler.TableSampler;
@@ -1131,7 +1134,7 @@ public abstract class BaseBrokerRoutingManager
           new RoutingEntry(tableNameWithType, idealStatePath, externalViewPath, segmentPreSelector, segmentSelector,
               segmentPruners, instanceSelector, idealStateVersion, externalViewVersion, segmentZkMetadataFetcher,
               timeBoundaryManager, partitionMetadataManager, queryTimeoutMs, samplerInfos,
-              !idealState.isEnabled(), preSelectedOnlineSegments.size());
+              !idealState.isEnabled(), preSelectedOnlineSegments.size(), _brokerMetrics);
       if (_routingEntryMap.put(tableNameWithType, routingEntry) == null) {
         LOGGER.info("Built routing for table: {}", tableNameWithType);
       } else {
@@ -1586,6 +1589,7 @@ public abstract class BaseBrokerRoutingManager
     final Long _queryTimeoutMs;
     final Map<String, SamplerInfo> _samplerInfos;
     final SegmentZkMetadataFetcher _segmentZkMetadataFetcher;
+    final BrokerMetrics _brokerMetrics;
 
     // Lets queries detect that an assignment update overlapped with their selection and pruning of segments
     final SegmentAssignmentEpoch _assignmentEpoch = new SegmentAssignmentEpoch();
@@ -1606,7 +1610,8 @@ public abstract class BaseBrokerRoutingManager
         InstanceSelector instanceSelector, int lastUpdateIdealStateVersion, int lastUpdateExternalViewVersion,
         SegmentZkMetadataFetcher segmentZkMetadataFetcher, @Nullable TimeBoundaryManager timeBoundaryManager,
         @Nullable SegmentPartitionMetadataManager partitionMetadataManager, @Nullable Long queryTimeoutMs,
-        Map<String, SamplerInfo> samplerInfos, boolean disabled, int numPreSelectedOnlineSegments) {
+        Map<String, SamplerInfo> samplerInfos, boolean disabled, int numPreSelectedOnlineSegments,
+        BrokerMetrics brokerMetrics) {
       _tableNameWithType = tableNameWithType;
       _idealStatePath = idealStatePath;
       _externalViewPath = externalViewPath;
@@ -1623,6 +1628,7 @@ public abstract class BaseBrokerRoutingManager
       _segmentZkMetadataFetcher = segmentZkMetadataFetcher;
       _disabled = disabled;
       _numPreSelectedOnlineSegments = numPreSelectedOnlineSegments;
+      _brokerMetrics = brokerMetrics;
     }
 
     String getTableNameWithType() {
@@ -1766,20 +1772,38 @@ public abstract class BaseBrokerRoutingManager
     }
 
     private Set<String> prune(BrokerRequest brokerRequest, Set<String> segments) {
-      Set<String> survivingSegments = segments;
-      for (SegmentPruner segmentPruner : _segmentPruners) {
-        survivingSegments = segmentPruner.prune(brokerRequest, survivingSegments);
-      }
-      return survivingSegments;
+      return prune(brokerRequest, segments, false);
     }
 
     /// Prunes with the pruners' faster variants, whose result is only valid if no assignment update overlapped.
     private Set<String> pruneAssumingSyncedScope(BrokerRequest brokerRequest, Set<String> segments) {
+      return prune(brokerRequest, segments, true);
+    }
+
+    private Set<String> prune(BrokerRequest brokerRequest, Set<String> segments, boolean assumeSyncedScope) {
       Set<String> survivingSegments = segments;
       for (SegmentPruner segmentPruner : _segmentPruners) {
-        survivingSegments = segmentPruner.pruneAssumingSyncedScope(brokerRequest, survivingSegments);
+        long startTimeNs = System.nanoTime();
+        survivingSegments = assumeSyncedScope ? segmentPruner.pruneAssumingSyncedScope(brokerRequest, survivingSegments)
+            : segmentPruner.prune(brokerRequest, survivingSegments);
+        recordPruningTime(segmentPruner, System.nanoTime() - startTimeNs);
       }
       return survivingSegments;
+    }
+
+    /// Records how long a pruner took, for the pruners that dominate routing time on large tables. A query whose
+    /// indexed pruning was discarded because of an overlapping assignment update records both runs.
+    private void recordPruningTime(SegmentPruner segmentPruner, long durationNs) {
+      BrokerTimer timer;
+      if (segmentPruner instanceof TimeSegmentPruner) {
+        timer = BrokerTimer.TIME_SEGMENT_PRUNING_TIME_MS;
+      } else if (segmentPruner instanceof SinglePartitionColumnSegmentPruner
+          || segmentPruner instanceof MultiPartitionColumnsSegmentPruner) {
+        timer = BrokerTimer.PARTITION_SEGMENT_PRUNING_TIME_MS;
+      } else {
+        return;
+      }
+      _brokerMetrics.addTimedTableValue(_tableNameWithType, timer, durationNs, TimeUnit.NANOSECONDS);
     }
 
     InstanceSelector.SelectionResult calculateRouting(BrokerRequest brokerRequest, long requestId,
@@ -1790,8 +1814,11 @@ public abstract class BaseBrokerRoutingManager
       Set<String> survivingSegments = selectedSegments._surviving;
       int numPrunedSegments = selectedSegments.getNumPruned();
       if (!survivingSegments.isEmpty()) {
+        long instanceSelectionStartTimeNs = System.nanoTime();
         InstanceSelector.SelectionResult selectionResult =
             instanceSelector.select(brokerRequest, survivingSegments, requestId);
+        _brokerMetrics.addTimedTableValue(_tableNameWithType, BrokerTimer.INSTANCE_SELECTION_TIME_MS,
+            System.nanoTime() - instanceSelectionStartTimeNs, TimeUnit.NANOSECONDS);
         selectionResult.setNumPrunedSegments(numPrunedSegments);
         return selectionResult;
       } else {

@@ -77,7 +77,14 @@ public enum BrokerTimer implements AbstractMetrics.Timer {
   // The total time spent in processing the workload queries
   WORKLOAD_TOTAL_QUERY_TIME_MS(false),
   // Time taken for remote cluster broker to compute routing table
-  REMOTE_CLUSTER_BROKER_ROUTING_CALCULATION_TIME_MS(true);
+  REMOTE_CLUSTER_BROKER_ROUTING_CALCULATION_TIME_MS(true),
+  // Time taken by TimeSegmentPruner within the queryRouting phase
+  TIME_SEGMENT_PRUNING_TIME_MS(false),
+  // Time taken by the partition-based segment pruners (single and multiple partition columns) within the queryRouting
+  // phase
+  PARTITION_SEGMENT_PRUNING_TIME_MS(false),
+  // Time taken by instance selection within the queryRouting phase
+  INSTANCE_SELECTION_TIME_MS(false);
 
   private final String _timerName;
   private final boolean _global;

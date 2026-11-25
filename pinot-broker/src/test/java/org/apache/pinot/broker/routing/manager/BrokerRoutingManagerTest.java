@@ -26,6 +26,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.apache.helix.AccessOption;
 import org.apache.helix.BaseDataAccessor;
@@ -699,7 +701,7 @@ public class BrokerRoutingManagerTest {
   @Test
   public void testGetPrunedSegmentsIsEmptyWhenAPrunerEditsInPlace()
       throws Exception {
-    SegmentPruner pruner = mock(SegmentPruner.class);
+    SegmentPruner pruner = prunerMock();
     when(pruner.prune(any(), any())).thenAnswer(invocation -> {
       Set<String> segments = invocation.getArgument(1);
       segments.remove("seg1");
@@ -711,6 +713,96 @@ public class BrokerRoutingManagerTest {
         createRoutingEntry(TEST_TABLE, segmentSelector, List.of(pruner), mock(InstanceSelector.class)));
 
     assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of());
+  }
+
+  /// A pruner whose [SegmentPruner#prune] drops `seg3` (the legacy scan) and whose
+  /// [SegmentPruner#pruneAssumingSyncedScope] drops `seg1` (the indexed path), so a test can tell which one produced
+  /// the result. `onSyncedPrune` runs inside the indexed path, i.e. while the query is between its epoch read and its
+  /// validation.
+  private static SegmentPruner prunerWithTwoPaths(Runnable onSyncedPrune) {
+    SegmentPruner pruner = prunerMock();
+    when(pruner.prune(any(), any())).thenAnswer(invocation -> withoutSegment(invocation.getArgument(1), "seg3"));
+    // doAnswer, because `when(pruner.pruneAssumingSyncedScope(...))` would call the real default method, and with it
+    // the stubbed prune() above, on the matcher placeholders
+    doAnswer(invocation -> {
+      onSyncedPrune.run();
+      return withoutSegment(invocation.getArgument(1), "seg1");
+    }).when(pruner).pruneAssumingSyncedScope(any(), any());
+    return pruner;
+  }
+
+  private static Set<String> withoutSegment(Set<String> segments, String segment) {
+    Set<String> result = new HashSet<>(segments);
+    result.remove(segment);
+    return result;
+  }
+
+  private BaseBrokerRoutingManager.RoutingEntry putEpochRoutingEntry(SegmentPruner pruner)
+      throws Exception {
+    Object routingEntry = createRoutingEntry(TEST_TABLE, selectorOf("seg1", "seg2", "seg3"), List.of(pruner),
+        mock(InstanceSelector.class));
+    putRoutingEntry(TEST_TABLE, routingEntry);
+    return (BaseBrokerRoutingManager.RoutingEntry) routingEntry;
+  }
+
+  @Test
+  public void testGetPrunedSegmentsUsesTheIndexedPathWhenNoAssignmentUpdateOverlaps()
+      throws Exception {
+    putEpochRoutingEntry(prunerWithTwoPaths(() -> {
+    }));
+
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg1"));
+  }
+
+  @Test
+  public void testGetPrunedSegmentsRerunsTheScanWhenAnAssignmentUpdateOverlaps()
+      throws Exception {
+    AtomicReference<BaseBrokerRoutingManager.RoutingEntry> entry = new AtomicReference<>();
+    AtomicBoolean updated = new AtomicBoolean();
+    SegmentPruner pruner = prunerWithTwoPaths(() -> {
+      // An update starts and completes while the first query is pruning
+      if (updated.compareAndSet(false, true)) {
+        SegmentAssignmentEpoch epoch = entry.get()._assignmentEpoch;
+        epoch.beginUpdate();
+        epoch.endUpdate();
+      }
+    });
+    entry.set(putEpochRoutingEntry(pruner));
+
+    // The indexed answer ("seg1") is discarded for the scan's ("seg3")
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg3"));
+    // The update has completed, so the next query is clean again
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg1"));
+  }
+
+  @Test
+  public void testGetPrunedSegmentsSkipsTheIndexedPathWhileAnUpdateIsRunning()
+      throws Exception {
+    SegmentPruner pruner = prunerWithTwoPaths(() -> {
+    });
+    BaseBrokerRoutingManager.RoutingEntry entry = putEpochRoutingEntry(pruner);
+    entry._assignmentEpoch.beginUpdate();
+
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg3"));
+    verify(pruner, never()).pruneAssumingSyncedScope(any(), any());
+  }
+
+  /// An update that threw never reaches `endUpdate()`, so queries must stay on the scan until a later one completes.
+  @Test
+  public void testGetPrunedSegmentsStaysOnTheScanAfterAFailedUpdateUntilALaterUpdateCompletes()
+      throws Exception {
+    SegmentPruner pruner = prunerWithTwoPaths(() -> {
+    });
+    BaseBrokerRoutingManager.RoutingEntry entry = putEpochRoutingEntry(pruner);
+    entry._assignmentEpoch.beginUpdate();
+
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg3"));
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg3"));
+
+    entry._assignmentEpoch.beginUpdate();
+    entry._assignmentEpoch.endUpdate();
+
+    assertEquals(_routingManager.getPrunedSegments(brokerRequest(TEST_TABLE)), Set.of("seg1"));
   }
 
   private static BrokerRequest brokerRequest(String tableNameWithType) {
@@ -732,11 +824,17 @@ public class BrokerRoutingManagerTest {
     return new SegmentsToQuery(new ArrayList<>(segments), new ArrayList<>(optionalSegments));
   }
 
+  /// A pruner whose default `pruneAssumingSyncedScope` runs for real, so it delegates to the stubbed `prune` the way a
+  /// pruner without an optimized variant does.
+  private static SegmentPruner prunerMock() {
+    return mock(SegmentPruner.class, withSettings().defaultAnswer(CALLS_REAL_METHODS));
+  }
+
   /// Mirrors [org.apache.pinot.broker.routing.segmentpruner.EmptySegmentPruner]: a fresh set when it prunes
   /// something, the very set it was handed when it does not.
   private static SegmentPruner prunerDropping(String... segments) {
     Set<String> droppedSegments = Set.of(segments);
-    SegmentPruner segmentPruner = mock(SegmentPruner.class);
+    SegmentPruner segmentPruner = prunerMock();
     when(segmentPruner.prune(any(), any())).thenAnswer(invocation -> {
       Set<String> candidateSegments = invocation.getArgument(1);
       if (droppedSegments.stream().noneMatch(candidateSegments::contains)) {

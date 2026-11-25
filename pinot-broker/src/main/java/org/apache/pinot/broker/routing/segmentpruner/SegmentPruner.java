@@ -28,4 +28,18 @@ public interface SegmentPruner extends SegmentZkMetadataFetchListener {
 
   /// Prunes the segments queried by the given broker request, returns the selected segments to be queried.
   Set<String> prune(BrokerRequest brokerRequest, Set<String> segments);
+
+  /// Same as [#prune], for callers that can verify afterwards that `segments` was selected from the same segment
+  /// assignment this pruner has been updated with, which lets the pruner skip the work of accounting for segments it
+  /// has not been told about.
+  ///
+  /// If the assignment did not change between the selection of `segments` and the return of this method, the result is
+  /// the same as [#prune]'s. If it did, the result may be missing segments that [#prune] would have kept (for example
+  /// a segment the pruner has just forgotten but `segments` still contains), so the caller must discard it and call
+  /// [#prune] instead.
+  ///
+  /// The default implementation has nothing to skip and delegates to [#prune].
+  default Set<String> pruneAssumingSyncedScope(BrokerRequest brokerRequest, Set<String> segments) {
+    return prune(brokerRequest, segments);
+  }
 }

@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.broker.routing.manager;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -1572,7 +1573,8 @@ public abstract class BaseBrokerRoutingManager
     }
   }
 
-  private static class RoutingEntry {
+  @VisibleForTesting
+  static class RoutingEntry {
     final String _tableNameWithType;
     final String _idealStatePath;
     final String _externalViewPath;
@@ -1584,6 +1586,9 @@ public abstract class BaseBrokerRoutingManager
     final Long _queryTimeoutMs;
     final Map<String, SamplerInfo> _samplerInfos;
     final SegmentZkMetadataFetcher _segmentZkMetadataFetcher;
+
+    // Lets queries detect that an assignment update overlapped with their selection and pruning of segments
+    final SegmentAssignmentEpoch _assignmentEpoch = new SegmentAssignmentEpoch();
 
     // Cache IdealState and ExternalView version for the last update
     transient int _lastUpdateIdealStateVersion;
@@ -1703,6 +1708,11 @@ public abstract class BaseBrokerRoutingManager
       Set<String> onlineSegments = getOnlineSegments(idealState);
       Set<String> preSelectedOnlineSegments = _segmentPreSelector.preSelect(onlineSegments);
       _numPreSelectedOnlineSegments = preSelectedOnlineSegments.size();
+      // The pruners (via the fetcher) are updated before the selectors, so until the samplers below are updated too, a
+      // query's selected segments can be older than what the pruners know. Queries use the epoch to detect that. If any
+      // step throws, the epoch is deliberately left unfinished: the components may be out of step with each other, so
+      // queries keep taking the safe path until a later update completes.
+      _assignmentEpoch.beginUpdate();
       _segmentZkMetadataFetcher.onAssignmentChange(idealState, externalView, preSelectedOnlineSegments);
       _segmentSelector.onAssignmentChange(idealState, externalView, preSelectedOnlineSegments);
       _instanceSelector.onAssignmentChange(idealState, externalView, preSelectedOnlineSegments);
@@ -1710,6 +1720,7 @@ public abstract class BaseBrokerRoutingManager
         _timeBoundaryManager.onAssignmentChange(idealState, externalView, preSelectedOnlineSegments);
       }
       updateSamplerInfos(idealState, externalView, preSelectedOnlineSegments);
+      _assignmentEpoch.endUpdate();
       _lastUpdateIdealStateVersion = idealState.getStat().getVersion();
       _lastUpdateExternalViewVersion = externalView.getStat().getVersion();
     }
@@ -1736,15 +1747,39 @@ public abstract class BaseBrokerRoutingManager
     /// the planner prove a partition empty that a real query would still have scanned, and that loses rows with no
     /// error anywhere.
     private SelectedSegments selectThenPrune(BrokerRequest brokerRequest, @Nullable SamplerInfo samplerInfo) {
+      long epochToken = _assignmentEpoch.startRead();
       SegmentSelector segmentSelector = samplerInfo != null ? samplerInfo._segmentSelector : _segmentSelector;
       Set<String> selectedSegments = segmentSelector.select(brokerRequest);
       Set<String> survivingSegments = selectedSegments;
       if (!selectedSegments.isEmpty()) {
-        for (SegmentPruner segmentPruner : _segmentPruners) {
-          survivingSegments = segmentPruner.prune(brokerRequest, survivingSegments);
+        if (epochToken != SegmentAssignmentEpoch.UNSTABLE) {
+          survivingSegments = pruneAssumingSyncedScope(brokerRequest, selectedSegments);
+          if (!_assignmentEpoch.isUnchanged(epochToken)) {
+            // An assignment update overlapped, so the segments may be older than what the pruners know
+            survivingSegments = prune(brokerRequest, selectedSegments);
+          }
+        } else {
+          survivingSegments = prune(brokerRequest, selectedSegments);
         }
       }
       return new SelectedSegments(selectedSegments, survivingSegments);
+    }
+
+    private Set<String> prune(BrokerRequest brokerRequest, Set<String> segments) {
+      Set<String> survivingSegments = segments;
+      for (SegmentPruner segmentPruner : _segmentPruners) {
+        survivingSegments = segmentPruner.prune(brokerRequest, survivingSegments);
+      }
+      return survivingSegments;
+    }
+
+    /// Prunes with the pruners' faster variants, whose result is only valid if no assignment update overlapped.
+    private Set<String> pruneAssumingSyncedScope(BrokerRequest brokerRequest, Set<String> segments) {
+      Set<String> survivingSegments = segments;
+      for (SegmentPruner segmentPruner : _segmentPruners) {
+        survivingSegments = segmentPruner.pruneAssumingSyncedScope(brokerRequest, survivingSegments);
+      }
+      return survivingSegments;
     }
 
     InstanceSelector.SelectionResult calculateRouting(BrokerRequest brokerRequest, long requestId,
